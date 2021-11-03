@@ -13,6 +13,7 @@ import json
 import time
 from scipy import signal, spatial
 
+
 def parseargs():
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--input-video', required=True,  help="Video to process.")
@@ -154,6 +155,114 @@ class FeatureTracker:
         self.frame_id = self.frame_id[-self.bf_overlap:]
         return results
 
+from models.matching import Matching
+from models.utils import frame2tensor
+
+class SuperGlueTracker:
+    def __init__(self):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.y_range = [0.1, 0.70]
+        torch.set_grad_enabled(False)
+        nms_radius = 4
+        keypoint_threshold = 0.002
+        max_keypoints = 8000
+        sinkhorn_iterations = 20
+        match_threshold = 0.4
+        superglue = 'outdoor'
+        self.config = {
+            'superpoint': {
+                'nms_radius': nms_radius,
+                'keypoint_threshold': keypoint_threshold,
+                'max_keypoints': max_keypoints
+            },
+            'superglue': {
+                'weights': superglue,
+                'sinkhorn_iterations': sinkhorn_iterations,
+                'match_threshold': match_threshold,
+            }
+        }
+        self.matching = Matching(self.config).eval().to(self.device)
+        self.keys = ['keypoints', 'scores', 'descriptors']
+
+        self.last_frame_sg_info = None
+        self.last_frame_kp_ids = []
+        self.last_frame_id = []
+        self.keypoint_counter = 0
+
+    def add_frame(self, img, frame_id):
+        vertical_offset = int(img.shape[0] * self.y_range[0] + 0.5)
+        img = img[vertical_offset:int(img.shape[0] * self.y_range[1] + 0.5)]
+        img_tensor = frame2tensor(img, self.device)
+
+        if self.last_frame_sg_info is None:
+            pred = self.matching.superpoint({'image': img_tensor})
+            self.last_frame_sg_info = {k+'0': pred[k] for k in self.keys}
+            self.last_frame_sg_info['image0'] = img_tensor
+
+            self.last_frame_id = frame_id
+            self.last_frame_kp_ids = [None] * self.last_frame_sg_info['keypoints0'][0].shape[0]
+            return None
+
+        pred = self.matching({**self.last_frame_sg_info, 'image1': img_tensor})
+        kpts0 = self.last_frame_sg_info['keypoints0'][0].cpu().numpy()
+        kpts1 = pred['keypoints1'][0].cpu().numpy()
+        matches = pred['matches0'][0].cpu().numpy()
+        confidence = pred['matching_scores0'][0].cpu().numpy()
+
+        for i in range(matches.shape[0]):
+            if self.last_frame_kp_ids[i] is None and matches[i] > -1:
+                self.last_frame_kp_ids[i] = self.keypoint_counter
+                self.keypoint_counter += 1
+
+        keypoint_results = {self.last_frame_kp_ids[i]: (kp[0], kp[1] + vertical_offset) for i, kp in enumerate(kpts0) if self.last_frame_kp_ids[i] is not None}
+        results = ([self.last_frame_id],
+                   [keypoint_results])
+
+        self.last_frame_sg_info = {k + '0': pred[k + '1'] for k in self.keys}
+        self.last_frame_sg_info['image0'] = img_tensor
+        last_frame_kp_ids = [None] * kpts1.shape[0]
+        for i, id in enumerate(self.last_frame_kp_ids):
+            if id is not None:
+                last_frame_kp_ids[matches[i]] = id
+        self.last_frame_kp_ids = last_frame_kp_ids
+        self.last_frame_id = frame_id
+
+        return results
+
+
+class ORBTracker:
+    def __init__(self):
+        self.frame_history = []
+        self.frame_id = []
+        self.orb = cv2.ORB_create(5000, 1.4, nlevels=4, firstLevel=0, WTA_K=4)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING2, True)
+
+    def add_frame(self, img, frame_id):
+        self.frame_history.append(img)
+        self.frame_id.append(frame_id)
+
+        if len(self.frame_history) < 2:
+            return None
+
+        kps1, desc1 = self.orb.detectAndCompute(img, None)
+        kps0, desc0 = self.orb.detectAndCompute(self.frame_history[-2], None)
+
+        matches = self.matcher.match(desc0, desc1)
+        img1 = np.stack([img] * 3, axis=2)
+        img0 = np.stack([self.frame_history[-2]] * 3, axis=2)
+
+        matches = sorted(matches, key=lambda m: m.distance)
+        final_img = cv2.drawMatches(img0, kps0, img1, kps1, matches[:40], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+
+        #for kp in kps:
+        #    cv2.circle(img, (int(kp.pt[0]), int(kp.pt[1])), int(kp.size / 2), (255, 0, 0))
+        cv2.imshow('img', final_img)
+        key = cv2.waitKey()
+        if key == 27:
+            exit(-1)
+
+        return None
+
 
 def get_rot_matrix(yaw, pitch):
     R1 = np.asarray(
@@ -168,18 +277,23 @@ def get_rot_matrix(yaw, pitch):
 
     return R2 @ R1
 
+
 def positions_to_view_direction(points, width, height):
     points = points.copy()
 
     points[:, 0] = points[:, 0] / width * np.pi * 2 - np.pi
-    points[:, 1] = (0.5 - points[:, 1] / height) * np.pi
+    points[:, 1] = (1 - points[:, 1] / height) * np.pi
 
     directions = np.zeros([points.shape[0], 3])
-    unit_vector = np.zeros([3, 1])
-    unit_vector[0] = 1
-    for p, d in zip(points, directions):
-        R = get_rot_matrix(p[0], p[1])
-        d[...] = R @ unit_vector.squeeze()
+    directions[:, 0] = np.cos(points[:, 0]) * np.sin(points[:, 1])
+    directions[:, 1] = -np.sin(points[:, 0]) * np.sin(points[:, 1])
+    directions[:, 2] = np.cos(points[:, 1])
+    #unit_vector = np.zeros([3, 1])
+    #unit_vector[0, 0] = 1
+    #for p, d in zip(points, directions):
+    #    #R = get_rot_matrix(p[0], p[1])
+    #    d[...] = np.asarray([np.cos(p[0]) * np.sin(p[1]), -np.sin(p[0]) * np.sin(p[1]), np.cos(p[1])])
+
     return directions
 
 def main():
@@ -196,27 +310,30 @@ def main():
     point_history = defaultdict(list)
     video = cv2.VideoCapture(args.input_video)
 
-    frame_id = -1
-    #video.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+    skip_frames = 1
 
-    tracker = FeatureTracker()
+    frame_id = -1
+    if frame_id > 0:
+        video.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+
+    tracker = SuperGlueTracker()
     while video.isOpened():
         ret, frame = video.read()
         if not ret:
             break
 
         frame_id += 1
-        #if frame_id % 1 == 0:
-        #    continue
+        if frame_id % skip_frames != 0:
+            continue
 
         if args.frame_rotation != 0:
             shift = int(args.frame_rotation * frame.shape[1])
             frame = np.concatenate([frame[:, shift:], frame[:, :shift]], axis=1)
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-
+        #frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
         draw_frame = np.stack([frame, frame, frame], axis=2)
+
         results = tracker.add_frame(frame, frame_id)
         frame_history[frame_id] = draw_frame
 
@@ -247,20 +364,21 @@ def main():
 
             print(f_id, len(frame_points[f_id]))
             for p_id in frame_points[f_id]:
-                '''old_pos = point_history[p_id][0]
-                for new_pos in point_history[p_id][1:]:
-                    a, b = old_pos
-                    c, d = new_pos
-                    cv2.line(draw_frame, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 1)
-                    #cv2.circle(draw_frame, (int(a), int(b)), 1, (0, 0, 255), -1)
-                    old_pos = new_pos
-                '''
+                if len(point_history[p_id]) > 1:
+                    old_pos = point_history[p_id][-2]
+                    for new_pos in point_history[p_id][-1:]:
+                        a, b = old_pos
+                        c, d = new_pos
+                        cv2.line(draw_frame, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 1)
+                        #cv2.circle(draw_frame, (int(a), int(b)), 1, (0, 0, 255), -1)
+                        old_pos = new_pos
+
 
                 a, b = point_history[p_id][-1]
                 cv2.circle(draw_frame, (int(a), int(b)), 2, (255, 0, 0), -1)
 
             cv2.imshow('vid', draw_frame)
-            key = cv2.waitKey(30)
+            key = cv2.waitKey(3)
             if key == 27:
                 exit(-1)
 
