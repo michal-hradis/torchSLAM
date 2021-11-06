@@ -57,6 +57,18 @@ def view(cam_trajectory, points, camera_point_assignment, resolution=1600, cente
 
     return img, center, size
 
+def two_line_intersections(p1, u1, p2, u2, min_distance=5, max_distance=500):
+    p = p1 - p2
+    t2 = (p.dot(u1) * u1.dot(u2) / u1.dot(u1) - p.dot(u2)) / (u1.dot(u2)**2 / u1.dot(u1) - u2.dot(u2))
+    t1 = (u2.dot(u1)*t2 - p.dot(u1)) / u1.dot(u1)
+    t2 = max(t2, min_distance)
+    t1 = max(t1, min_distance)
+    t2 = min(t2, max_distance)
+    t1 = min(t1, max_distance)
+    P1 = p1 + u1 * t1
+    P2 = p2 + u2 * t2
+    PI = (P1 + P2) / 2.0
+    return PI
 
 class IncrementalSLAM:
     def __init__(self):
@@ -64,11 +76,12 @@ class IncrementalSLAM:
         self.p_count = 0
         self.v_count = 0
         self.c_max = 20000
-        self.p_max = 1000000
-        self.v_max = 10000000
+        self.p_max = 5000000
+        self.v_max = 50000000
 
         self.c_pos = np.zeros([self.c_max, 3], dtype=np.float32)
         self.c_pos_gt = np.zeros([self.c_max, 3], dtype=np.float32)
+        self.c_pos_weight = np.zeros([self.c_max], dtype=np.float32)
         self.c_dist = np.zeros([self.c_max], dtype=np.float32)
         self.c_dist_weight = np.zeros([self.c_max], dtype=np.float32)
         self.c_rot = np.zeros([self.c_max, 3], dtype=np.float32)
@@ -87,7 +100,7 @@ class IncrementalSLAM:
         self.lr = 0.3
         self.cam_dist_weight = 0.25
         self.rot_scale = 0.05
-        self.resolution = 800
+        self.resolution = 1200
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.out = cv2.VideoWriter('out.avi', cv2.VideoWriter_fourcc('m', 'p', '4', 'v'), 30, (self.resolution, self.resolution))
 
@@ -107,15 +120,19 @@ class IncrementalSLAM:
         las_data.write(file_name)
 
 
-    def two_line_intersections(p1, u1, p2, u2):
-        p = p1 - p2
-        t2 = (p.dot(u1) * u1.dot(u2) / u1.dot(u1) - p.dot(u2)) / (u1.dot(u2)**2 / u1.dot(u1) - u2.dot(u2))
-        t1 = (u2.dot(u1)*t2 - p.dot(u1)) / u1.dot(u1)
-        P1 = p1 + u1 * t1
-        P2 = p2 + u2 * t2
-        PI = (P1 + P2) / 2.0
-        return PI
 
+    def triangulate_new_point(self, p_id, c_pos, c_rot):
+        point_cameras = sorted(list(self.point_cam_map[p_id]))
+        c1 = point_cameras[0]
+        c2 = point_cameras[-1]
+        R1 = transforms.euler_angles_to_matrix(torch.tensor(c_rot[c1] * self.rot_scale),
+                                               convention='XYZ').numpy().squeeze()
+        R2 = transforms.euler_angles_to_matrix(torch.tensor(c_rot[c2] * self.rot_scale),
+                                               convention='XYZ').numpy().squeeze()
+        u1 = (R1 @ self.view_dir[self.view_map[c1, p_id]].reshape(3, 1)).squeeze()
+        u2 = (R2 @ self.view_dir[self.view_map[c2, p_id]].reshape(3, 1)).squeeze()
+
+        return two_line_intersections(c_pos[c1], u1, c_pos[c2], u2)
 
     def add_camera(self, position, rotation, view_vectors, point_ids, camera_dist, camera_dist_weight,
                    base_point_distance=42, c_pos_gt=None):
@@ -162,7 +179,6 @@ class IncrementalSLAM:
 
         #cam_dist_cost = (torch.sum((c_pos[1:] - c_pos[:-1]) ** 2, axis=1) ** 0.5 - c_dist[:-1]) ** 2
         #cam_dist_cost = cam_dist_cost * c_dist_weight[:-1]
-        cam_dist_cost = 0
 
         cam_pos_cost = torch.norm(c_pos - c_pos_gt, dim=1)**2 * c_dist_weight
 
@@ -186,24 +202,35 @@ class IncrementalSLAM:
         opt = torch.sum(view_loss) + self.cam_dist_weight * torch.sum(cam_pos_cost)
         return opt, view_loss
 
-    def optimize_both(self, optimized_cam_ids, new_stuff=True, iterations=850, episode_lr=1):
+    def remove_underground_points(self, optimized_point_ids):
+        for p_id in set(optimized_point_ids) - self.rejected_points:
+            if self.p_pos[p_id, 2] < self.c_pos[list(self.point_cam_map[p_id]), 2].min() - 10:
+                self.rejected_points.add(p_id)
+
+    def remove_distant_points(self, optimized_point_ids, max_distance=100):
+        for p_id in set(optimized_point_ids) - self.rejected_points:
+            if np.linalg.norm(self.p_pos[p_id] - np.mean(self.c_pos[list(self.point_cam_map[p_id])], axis=0)) > max_distance:
+                self.rejected_points.add(p_id)
+
+
+    def optimize_both(self, optimized_cam_ids, new_stuff=True, iterations=150, episode_lr=1, show_interval=50):
         optimized_cam_ids = sorted(list(set(optimized_cam_ids)))
 
         last_time = time.time()
         if self.optimized_cams and new_stuff:
             self.max_iter = iterations
-            self.init_iter = 100
-            lr_schedule = [self.lr * episode_lr] * self.init_iter \
-                          + ((np.linspace(0.0001, 1, self.init_iter) ** 0.5) * self.lr * episode_lr).tolist()\
+            self.init_iter = 20
+            lr_schedule = (np.linspace(0.001, 0.000001, self.init_iter) ** 0.5 * episode_lr).tolist() \
+                          + ((np.linspace(0.0001, 1, self.init_iter) ** 0.5) * self.lr * episode_lr).tolist() \
                           + ((np.linspace(1, 0.0001, self.max_iter - 2 * self.init_iter) ** 0.4) * self.lr * episode_lr).tolist()
         else:
-            self.max_iter = iterations * 3
+            self.max_iter = iterations
             self.init_iter = 0
             lr_schedule = ((np.linspace(0.0001, 1, self.init_iter) ** 0.5) * self.lr * episode_lr).tolist()\
                           + ((np.linspace(1, 0.0001, self.max_iter - self.init_iter) ** 0.4) * self.lr * episode_lr).tolist()
 
         optimized_point_ids = set().union(*[self.cam_point_map[i] for i in optimized_cam_ids]) - self.rejected_points
-        min_point_constraint_count = 3
+        min_point_constraint_count = 2
         optimized_point_ids = {p_id for p_id in optimized_point_ids if len(self.point_cam_map[p_id]) >= min_point_constraint_count}
 
         c_i = []
@@ -214,17 +241,22 @@ class IncrementalSLAM:
             c_i += cam_id
             p_i += optimized_cam_points
 
-        v_i = [self.view_map[c, p] for c, p in zip(c_i, p_i)]
-        view_dir = torch.tensor(self.view_dir[v_i]).float().to(self.device)
-
-
         optimized_point_ids = sorted(list(optimized_point_ids))
         optimized_points_new_id = range(len(optimized_point_ids))
         optimized_points_id_map = {orig_id: new_id for orig_id, new_id in zip(optimized_point_ids, optimized_points_new_id)}
-        p_i = [optimized_points_id_map[orig_id] for orig_id in p_i]
 
-        c_i = torch.tensor(c_i).to(self.device)
-        p_i = torch.tensor(p_i).to(self.device)
+        if self.optimized_cams and new_stuff:
+            c_i_t = [c_i[i] for i in range(len(p_i)) if p_i[i] in self.optimized_points]
+            p_i_t = [i for i in p_i if i in self.optimized_points]
+        else:
+            c_i_t = c_i
+            p_i_t = p_i
+
+        v_i = [self.view_map[c, p] for c, p in zip(c_i_t, p_i_t)]
+        p_i_t = [optimized_points_id_map[orig_id] for orig_id in p_i_t]
+        view_dir = torch.tensor(self.view_dir[v_i]).float().to(self.device)
+        c_i_t = torch.tensor(c_i_t).to(self.device)
+        p_i_t = torch.tensor(p_i_t).to(self.device)
 
         # move camera information to torch/GPU
         c_dist = torch.tensor(self.c_dist[:self.c_count]).float().to(self.device)
@@ -237,7 +269,6 @@ class IncrementalSLAM:
 
         # move point information to torch/GPU
         p_pos = torch.tensor(self.p_pos[optimized_point_ids]).float().to(self.device)
-        p_pos_orig = p_pos.detach().clone()
 
         print(f'Cameras: {c_pos.shape[0]}, Points: {p_pos.shape[0]}, Connections: {view_dir.shape[0]}')
 
@@ -249,8 +280,14 @@ class IncrementalSLAM:
         old_points = torch.tensor(sorted([optimized_points_id_map[i] for i in self.optimized_points & set(optimized_point_ids)])).long().to(self.device)
         static_cams = torch.tensor(sorted(list(set(range(self.c_count)) - set(optimized_cam_ids)))).long().to(self.device)
 
-        params = [c_pos, c_rot, p_pos]
+        if self.optimized_cams and new_stuff:
+            params = [c_pos, c_rot]
+        else:
+            params = [c_pos, c_rot, p_pos]
         optimizer = torch.optim.Adam(params, lr=self.lr, betas=(0.90, 0.99))
+
+        print(f'Init time: {time.time() - last_time:.3f}')
+        last_time = time.time()
 
         for i in range(self.max_iter):
             for g in optimizer.param_groups:
@@ -258,30 +295,47 @@ class IncrementalSLAM:
 
             optimizer.zero_grad()
             loss, view_loss = self.problem_loss(
-                c_pos, c_rot, c_i, p_pos, p_i, view_dir, c_dist, c_pos_gt, c_dist_weight)
+                c_pos, c_rot, c_i_t, p_pos, p_i_t, view_dir, c_dist, c_pos_gt, c_dist_weight)
             loss.backward()
             optimizer.step()
             loss = loss.cpu().item()
 
             with torch.no_grad():
-                if self.optimized_cams and i < self.init_iter:
+                if self.optimized_cams and new_stuff and i < self.init_iter:
                     c_pos[old_cams] = c_pos_orig[old_cams]
                     c_rot[old_cams] = c_rot_orig[old_cams]
-                    p_pos[old_points] = p_pos_orig[old_points]
                 else:
                     c_pos[static_cams] = c_pos_orig[static_cams]
                     c_rot[static_cams] = c_rot_orig[static_cams]
 
-            if i % 25 == 0:
+                if self.optimized_cams and new_stuff and i == self.init_iter:
+                    c_pos_cpu = c_pos.detach().cpu().numpy()
+                    c_rot_cpu = c_rot.detach().cpu().numpy()
+                    for new_point_id in set(p_i) - self.optimized_points:
+                        self.p_pos[new_point_id] = self.triangulate_new_point(
+                            new_point_id, c_pos_cpu, c_rot_cpu)
+                    p_pos = torch.tensor(self.p_pos[optimized_point_ids]).float().to(self.device)
+                    p_pos.requires_grad = True
+
+                    v_i = [self.view_map[c, p] for c, p in zip(c_i, p_i)]
+                    p_i = [optimized_points_id_map[orig_id] for orig_id in p_i]
+                    view_dir = torch.tensor(self.view_dir[v_i]).float().to(self.device)
+                    c_i_t = torch.tensor(c_i).to(self.device)
+                    p_i_t = torch.tensor(p_i).to(self.device)
+                    params = [c_pos, c_rot, p_pos]
+                    optimizer = torch.optim.Adam(params, lr=lr_schedule[i], betas=(0.90, 0.99))
+
+            if i % show_interval == 0:
                 #for c in c_rot.detach().cpu().numpy()[:self.c_count]:
                 #    print(c * self.rot_scale * 180 / np.pi)
                 #print()
                 #print('==============================')
 
-                print(i, loss)
+                print(f'{i}, {loss}, {show_interval / (time.time() - last_time):.1f}')
+                last_time = time.time()
                 img, _, _ = view(
                     c_pos.detach().cpu().numpy()[-100:], p_pos.detach().cpu().numpy(), None,
-                    resolution=self.resolution, p_i=p_i.detach().cpu().numpy())
+                    resolution=self.resolution, p_i=p_i_t.detach().cpu().numpy())
                 self.out.write(img)
 
                 cv2.imshow('result', img)
@@ -331,7 +385,7 @@ class IncrementalSLAM:
                 last_time = time.time()
 
         view_loss = view_loss.detach().cpu().numpy()
-        p_i_cpu = p_i.detach().cpu().numpy()
+        p_i_cpu = p_i_t.detach().cpu().numpy()
         errors = np.asarray([np.median(view_loss[p_i_cpu == p_id]) ** (1.0/self.error_power) for p_id in optimized_points_new_id])
         if self.use_dot_product:
             errors = np.arccos(1 - errors) * 180 / np.pi
@@ -351,6 +405,8 @@ class IncrementalSLAM:
         cam_pos_error = np.linalg.norm(self.c_pos[max(0, self.c_count-20):self.c_count] - self.c_pos_gt[max(0, self.c_count-20):self.c_count], axis=1)
         cam_pos_error = np.mean(cam_pos_error)
         print(f'Camera position error at camera {self.c_count}: {cam_pos_error}')
+        self.remove_underground_points(optimized_point_ids)
+        self.remove_distant_points(optimized_point_ids, max_distance=100)
 
         #for c in self.c_rot[:self.c_count]:
         #    print(c * self.rot_scale * 180 / np.pi)

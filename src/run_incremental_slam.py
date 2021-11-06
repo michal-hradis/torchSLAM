@@ -22,10 +22,16 @@ def parseargs():
                         help="Horizontal camera alinment cost weight.")
     parser.add_argument('--json-recording', help='Read viewing directions from json file.')
     parser.add_argument('--out-laz', help='Output laz file name.')
+    parser.add_argument('--opt-iterations', default=250, type=int, help='Output laz file name.')
     parser.add_argument('--start-frames', default=20, type=int, help='Frames for SLAM initialization.')
+    parser.add_argument('--skip-first-frames', default=0, type=int, help='How many frames to skip at the beginning of the video sequence.')
+    parser.add_argument('--frame-rate-subsampling', default=1, type=int, help='Take every n(th) frame from video sequence.')
     parser.add_argument('--optimization-interval', default=5, type=int, help='Run SLAM optimization each n frames.')
     parser.add_argument('--optimized-cams', default=40, type=int, help='Run pose estimation on last n cameras.')
     parser.add_argument('--geojson', help='Geojson with camera positions. Can be used to show ground truth trajectory.')
+    parser.add_argument('--optimal-camera-distance', type=float, help='If specify, try to drop some input frames to maintain this distance between cameras.')
+    parser.add_argument('--maximum-skip-frames', default=20, type=int, help='Maximum number of frames that can be skipped when useing --optimal-camera-distance.')
+    parser.add_argument('--point-subsampling', default=1, type=int, help='Reduction of points by this factor.')
 
     args = parser.parse_args()
     return args
@@ -65,53 +71,69 @@ def main():
     slam = IncrementalSLAM()
 
     c_pos_gt = read_geo_json(args.geojson) if args.geojson else [None] * 100000
-    if c_pos_gt is not None:
+    if args.geojson:
         c_pos_gt -= np.mean(c_pos_gt, axis=0, keepdims=True)
 
+    point_subsampling = 10
     slam_cam_id = -1
     point_ids_map = {}
-    skip = 1
     first = True
+    last_pos = None
     with open(args.json_recording, 'r') as f:
-        #for i in range(500):
-        #    f.readline()
+        for i in range(args.skip_first_frames):
+            f.readline()
 
         for record_id, record in enumerate(f):
-            if record_id % skip != 0:
+            if record_id % args.frame_rate_subsampling != 0:
                 continue
+
             frame_id, point_ids, directions = read_record(record)
-            directions = [directions[i] for i in range(len(point_ids)) if i % 1 == 0]
-            point_ids = [point_ids[i] for i in range(len(point_ids)) if i % 1 == 0]
+            if args.point_subsampling > 1:
+                directions = [directions[i] for i in range(len(point_ids)) if i % args.point_subsampling == 0]
+                point_ids = [point_ids[i] for i in range(len(point_ids)) if i % args.point_subsampling == 0]
 
             slam_point_ids = [point_ids_map[i] if i in point_ids_map else None for i in point_ids]
+
             if slam_cam_id < args.start_frames:
+                if c_pos_gt[record_id] is not None:
+                    cam_pos = c_pos_gt[slam_cam_id+1]
+                else:
+                    cam_pos = np.asarray([slam_cam_id+1, 0, 0])
+
+                if last_pos is None:
+                    last_pos = cam_pos
+
+                camera_dist = np.linalg.norm(last_pos-cam_pos)
+
                 slam_cam_id, slam_point_ids = slam.add_camera(
-                    c_pos_gt[record_id], np.zeros(3),
+                    cam_pos, np.zeros(3),
                     directions, slam_point_ids,
-                    camera_dist=1, camera_dist_weight=10000, c_pos_gt=c_pos_gt[record_id])
+                    camera_dist=camera_dist, camera_dist_weight=10000, c_pos_gt=c_pos_gt[record_id])
+                last_pos = slam.c_pos[slam_cam_id]
             else:
-                last_pos = 2*slam.c_pos[slam_cam_id] - slam.c_pos[slam_cam_id-1]
+                new_pos = 2*slam.c_pos[slam_cam_id] - slam.c_pos[slam_cam_id-1]
                 last_rot = slam.c_rot[slam_cam_id] + np.random.normal(size=3) * 0.1
+                camera_dist = np.linalg.norm(last_pos - cam_pos)
                 slam_cam_id, slam_point_ids = slam.add_camera(
-                    last_pos, last_rot,
+                    new_pos, last_rot,
                     directions, slam_point_ids,
-                    camera_dist=1, camera_dist_weight=0.0, c_pos_gt=c_pos_gt[record_id])
+                    camera_dist=camera_dist, camera_dist_weight=0.0, c_pos_gt=c_pos_gt[record_id])
+                last_pos = slam.c_pos[slam_cam_id]
 
             for s_id, c_id in zip(slam_point_ids, point_ids):
                 point_ids_map[c_id] = s_id
 
-            if slam_cam_id > args.start_frames and slam_cam_id % args.optimization_interval == 0:
+            if slam_cam_id == args.start_frames or slam_cam_id > args.start_frames and slam_cam_id % args.optimization_interval == 0:
                 if first:
                     first = False
-                    slam.optimize_both(range(0, slam_cam_id + 1))
+                    slam.optimize_both(range(0, slam_cam_id + 1), iterations=1500)
                 else:
-                    slam.optimize_both(range(max(0, slam_cam_id - args.optimized_cams), slam_cam_id + 1))
+                    slam.optimize_both(range(max(0, slam_cam_id - args.optimized_cams), slam_cam_id + 1), iterations=args.opt_iterations)
                 #slam.optimize_both(range(max(0, slam_cam_id - args.optimized_cams), slam_cam_id + 1), new_stuff=False)
                 #if slam_cam_id % (optimization_interval * 10) == 0:
                 #    slam.optimize_both(range(slam_cam_id + 1), new_stuff=False, iterations=2000, episode_lr=0.2)
                 if args.out_laz:
                     slam.save_laz(args.out_laz)
-
 
 
 if __name__ == "__main__":
