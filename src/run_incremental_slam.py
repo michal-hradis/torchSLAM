@@ -74,7 +74,6 @@ def main():
     if args.geojson:
         c_pos_gt -= np.mean(c_pos_gt, axis=0, keepdims=True)
 
-    point_subsampling = 10
     slam_cam_id = -1
     point_ids_map = {}
     first = True
@@ -92,6 +91,7 @@ def main():
                 directions = [directions[i] for i in range(len(point_ids)) if i % args.point_subsampling == 0]
                 point_ids = [point_ids[i] for i in range(len(point_ids)) if i % args.point_subsampling == 0]
 
+            print(record_id, frame_id)
             slam_point_ids = [point_ids_map[i] if i in point_ids_map else None for i in point_ids]
 
             if slam_cam_id < args.start_frames:
@@ -108,17 +108,17 @@ def main():
                 slam_cam_id, slam_point_ids = slam.add_camera(
                     cam_pos, np.zeros(3),
                     directions, slam_point_ids,
-                    camera_dist=camera_dist, camera_dist_weight=10000, c_pos_gt=c_pos_gt[record_id])
-                last_pos = slam.c_pos[slam_cam_id]
+                    c_dist=camera_dist, c_dist_weight=0.00001, c_pos_gt=c_pos_gt[record_id], c_pos_weight=0)
+                last_pos = slam.camera.c_pos[slam_cam_id].detach().cpu().numpy()
             else:
-                new_pos = 2*slam.c_pos[slam_cam_id] - slam.c_pos[slam_cam_id-1]
-                last_rot = slam.c_rot[slam_cam_id] + np.random.normal(size=3) * 0.1
+                new_pos = (2*slam.camera.c_pos[slam_cam_id] - slam.camera.c_pos[slam_cam_id-1]).detach().cpu().numpy()
+                last_rot = slam.camera.c_rot[slam_cam_id].detach().cpu().numpy() + np.random.normal(size=3) * 0.01
                 camera_dist = np.linalg.norm(last_pos - cam_pos)
                 slam_cam_id, slam_point_ids = slam.add_camera(
                     new_pos, last_rot,
                     directions, slam_point_ids,
-                    camera_dist=camera_dist, camera_dist_weight=0.0, c_pos_gt=c_pos_gt[record_id])
-                last_pos = slam.c_pos[slam_cam_id]
+                    c_dist=camera_dist, c_dist_weight=0.0, c_pos_gt=c_pos_gt[record_id], c_pos_weight=0)
+                last_pos = slam.camera.c_pos[slam_cam_id].detach().cpu().numpy()
 
             for s_id, c_id in zip(slam_point_ids, point_ids):
                 point_ids_map[c_id] = s_id
@@ -126,7 +126,8 @@ def main():
             if slam_cam_id == args.start_frames or slam_cam_id > args.start_frames and slam_cam_id % args.optimization_interval == 0:
                 if first:
                     first = False
-                    slam.optimize_both(range(0, slam_cam_id + 1), iterations=1500)
+                    slam.triangulate()
+                    slam.optimize_both(range(0, slam_cam_id + 1), iterations=1600, new_cams=False)
                 else:
                     slam.optimize_both(range(max(0, slam_cam_id - args.optimized_cams), slam_cam_id + 1), iterations=args.opt_iterations)
                 #slam.optimize_both(range(max(0, slam_cam_id - args.optimized_cams), slam_cam_id + 1), new_stuff=False)
