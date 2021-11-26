@@ -19,6 +19,8 @@ def parseargs():
     parser.add_argument('-i', '--input-video', required=True,  help="Video to process.")
     parser.add_argument('-o', '--output-file', help="Output json file.")
     parser.add_argument('--frame-rotation', default=0, type=float, help="Rotate the video.")
+    parser.add_argument('--frame-speed-file', help="csv with frame, speed (in m/s) values on each line.")
+    parser.add_argument('--video-subsampling', default=1, type=int, help="How the input video is subsampled compared to it's original version.")
 
     args = parser.parse_args()
     return args
@@ -161,11 +163,11 @@ from models.utils import frame2tensor
 class SuperGlueTracker:
     def __init__(self):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.y_range = [0.1, 0.70]
+        self.y_range = [0.1, 0.64]
         torch.set_grad_enabled(False)
         nms_radius = 4
-        keypoint_threshold = 0.002
-        max_keypoints = 8000
+        keypoint_threshold = 0.003
+        max_keypoints = 4000
         sinkhorn_iterations = 20
         match_threshold = 0.4
         superglue = 'outdoor'
@@ -296,6 +298,24 @@ def positions_to_view_direction(points, width, height):
 
     return directions
 
+def get_frame_distances(file_name):
+    frame_rate = 30
+    last_speed = 0
+    last_distance = 0
+    distances = []
+    with open(file_name, 'r') as f:
+        for line in f:
+            spd, frm = line.split()
+            spd = float(spd)
+            frm = int(frm)
+            while len(distances) <= frm:
+                last_distance = last_distance + last_speed / frame_rate
+                distances.append(last_distance)
+            last_speed = spd
+
+    return distances
+
+
 def main():
     args = parseargs()
     print('ARGS', args)
@@ -305,6 +325,12 @@ def main():
     else:
         output_file = None
 
+
+    if args.frame_speed_file:
+        distances = get_frame_distances(args.frame_speed_file)
+
+    print(distances)
+
     frame_history = {}
     frame_points = {}
     point_history = defaultdict(list)
@@ -312,7 +338,8 @@ def main():
 
     skip_frames = 1
 
-    frame_id = -1
+    last_distance = -100
+    frame_id = 0
     if frame_id > 0:
         video.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
 
@@ -320,18 +347,22 @@ def main():
     while video.isOpened():
         ret, frame = video.read()
         if not ret:
+            print('died')
             break
 
-        frame_id += 1
+        frame_id += args.video_subsampling
         if frame_id % skip_frames != 0:
             continue
+        if last_distance + 0.7 > distances[frame_id]:
+            continue
+        last_distance = distances[frame_id]
 
         if args.frame_rotation != 0:
             shift = int(args.frame_rotation * frame.shape[1])
             frame = np.concatenate([frame[:, shift:], frame[:, :shift]], axis=1)
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        #frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        #frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
         draw_frame = np.stack([frame, frame, frame], axis=2)
 
         results = tracker.add_frame(frame, frame_id)
@@ -362,7 +393,7 @@ def main():
                 print(json.dumps({'video_frame': f_id, 'point_ids': list(frame_points[f_id]), 'directions': directions}),
                       file=output_file)
 
-            print(f_id, len(frame_points[f_id]))
+            print(f_id, len(frame_points[f_id]), distances[f_id])
             for p_id in frame_points[f_id]:
                 if len(point_history[p_id]) > 1:
                     old_pos = point_history[p_id][-2]
